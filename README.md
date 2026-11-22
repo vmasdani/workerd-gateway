@@ -1,5 +1,7 @@
 # workerd-gateway
 
+![workerd-gateway overview: one workerd process hosting many apps, with routing, codegen, secrets, storage, databases, cache, jobs and observability around it](docs/overview.png)
+
 One [workerd](https://github.com/cloudflare/workerd) process, run as a system-wide systemd service, hosts many apps.
 A small gateway worker in front of them picks the app for each request:
 
