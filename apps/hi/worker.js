@@ -17,6 +17,6 @@ export default {
 	// Called by workerd's cron scheduler for each expression in cron.json.
 	// Same handler as Cloudflare Workers cron triggers. A thrown error counts as a failed run and is retried.
 	async scheduled(controller) {
-		console.log(`hello: cron "${controller.cron}" at ${new Date(controller.scheduledTime).toISOString()}`);
+		console.log(`hi: cron "${controller.cron}" at ${new Date(controller.scheduledTime).toISOString()}`);
 	},
 };
