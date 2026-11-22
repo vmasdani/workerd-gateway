@@ -337,3 +337,84 @@ Trade-offs:
 | `bun run dev` | build, generate, then `workerd serve --verbose` |
 | `bun run start` | `workerd serve config.capnp` |
 | `bun run typecheck` | `bun check` |
+
+## Recommended companion services
+
+The hub runs only Workers. Anything else an app needs runs as its own service next to workerd, and apps reach it over
+HTTP or TCP.
+
+These services usually listen on localhost or a private network, and workerd's default outbound access only reaches
+public addresses. An app that calls them needs a network service such as
+`(name = "net", network = (allow = ["public", "private", "local"]))` in the hub config, plus `globalOutbound = "net"` in
+its `worker.capnp`. `gen.ts` doesn't generate that yet.
+
+### Timers and scheduled jobs
+
+Self-hosted workerd has no cron triggers. On Cloudflare, cron triggers are a platform feature. Options:
+
+- **Durable Object alarms** (workerd-native): an object calls `this.ctx.storage.setAlarm(time)`, and workerd calls its
+  `alarm()` handler at that time. Alarms need Durable Object storage, so the multi-instance state caveats above apply.
+- **systemd timer or cron** (simplest): call an HTTP endpoint on the app through the gateway.
+  ```ini
+  # /etc/systemd/system/app-a-daily.service
+  [Service]
+  Type=oneshot
+  EnvironmentFile=/etc/workerd-gateway/env
+  ExecStart=/usr/bin/curl -fsS -X POST -H "Authorization: Bearer ${APP_A_CRON_TOKEN}" http://127.0.0.1:8080/app-a/_cron/daily
+
+  # /etc/systemd/system/app-a-daily.timer
+  [Timer]
+  OnCalendar=daily
+  Persistent=true
+
+  [Install]
+  WantedBy=timers.target
+  ```
+  `sudo systemctl enable --now app-a-daily.timer`. With `Persistent=true`, a run missed while the machine was off
+  happens at the next boot.
+- **Your own scheduler** (for example a small Rust service): use this when you need queues, retries, backoff or job
+  history. It calls app endpoints the same way.
+
+**The cron endpoint must check a token.** nginx and Caddy expose every app path publicly, so without a check anyone
+can trigger `/_cron/*`.
+
+### Secrets
+
+- **[Infisical](https://infisical.com)** (self-hostable): `infisical run -- workerd serve config.capnp`. See
+  [Environment variables and secrets](#environment-variables-and-secrets).
+- **[OpenBao](https://openbao.org) or HashiCorp Vault:** needs a launcher (option 2), or the Vault Agent writing an env
+  file that systemd reads.
+- **[SOPS](https://github.com/getsops/sops):** secrets live encrypted in git. `sops exec-env secrets.enc.env 'workerd serve config.capnp'`.
+
+### Media and files (S3-compatible object storage)
+
+- **[RustFS](https://rustfs.com):** S3-compatible storage written in Rust.
+- **[MinIO](https://min.io):** the most widely used S3-compatible server. Check the current license and how the
+  community edition is distributed before you adopt it.
+- **[Garage](https://garagehq.deuxfleurs.fr) or [SeaweedFS](https://github.com/seaweedfs/seaweedfs):** lighter
+  alternatives, good for small or geo-distributed setups.
+
+From a Worker, call any of them through the S3 API with [`aws4fetch`](https://github.com/mhart/aws4fetch), which only
+needs `fetch` and WebCrypto. The same code works against Cloudflare R2's S3 endpoint, so apps stay portable. For large
+uploads, hand the browser a presigned URL instead of streaming the file through the Worker.
+
+### Database
+
+- **SQLite in a Durable Object:** workerd-native, and Drizzle supports it (`drizzle-orm/durable-sqlite`). Use only
+  with a single instance, or with that app pinned to one instance.
+- **[libSQL / sqld](https://github.com/tursodatabase/libsql):** SQLite as a server over HTTP. Use
+  `@libsql/client/web` from Workers; Drizzle supports it (`drizzle-orm/libsql`). It's safe with many instances because
+  the state lives outside workerd.
+- **PostgreSQL:** reachable over TCP with `connect()` from `cloudflare:sockets`, using a driver that supports Workers
+  (for example `postgres` with the `nodejs_compat` flag).
+
+### Cache and key-value
+
+- **[Valkey](https://valkey.io) or Redis:** over TCP with `cloudflare:sockets`, or over HTTP through a REST proxy
+  compatible with Upstash's `@upstash/redis`.
+
+### Logs
+
+workerd writes `console.log` output to stdout, so under systemd it goes to journald
+(`journalctl -u workerd-gateway -f`). To ship logs elsewhere, collect from journald with
+[Vector](https://vector.dev) or Grafana Alloy and send them to Loki or similar.
