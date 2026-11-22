@@ -1,9 +1,9 @@
-# Multi-instance: one upstream per workerd-gateway@<port> instance.
+# Multi-instance: workerd-gateway.service (8080, runs crons) plus one workerd-gateway@<port> per extra core.
 *.mydomain.com {
 	tls {
 		dns cloudflare {env.CF_API_TOKEN}
 	}
-	reverse_proxy 127.0.0.1:8081 127.0.0.1:8082 127.0.0.1:8083 127.0.0.1:8084 {
+	reverse_proxy 127.0.0.1:8080 127.0.0.1:8081 127.0.0.1:8082 127.0.0.1:8083 {
 		lb_policy least_conn
 		health_uri /_gateway/health
 	}

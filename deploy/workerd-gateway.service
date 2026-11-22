@@ -1,4 +1,4 @@
-# Single instance: one workerd process, one CPU core for JavaScript.
+# Single instance: one workerd process, one CPU core for JavaScript. Also runs the cron scheduler.
 # Install: sudo cp deploy/workerd-gateway.service /etc/systemd/system/
 #          sudo systemctl daemon-reload && sudo systemctl enable --now workerd-gateway
 [Unit]
@@ -12,13 +12,16 @@ Group=workerd
 WorkingDirectory=/opt/workerd-gateway
 # Secrets for apps (fromEnvironment bindings). Keep this file mode 0600, owned by root.
 EnvironmentFile=-/etc/workerd-gateway/env
-ExecStart=/opt/workerd-gateway/node_modules/.bin/workerd serve config.capnp
+# --experimental: the built-in cron scheduler (bundled /workerd/cron.js) needs it.
+ExecStart=/opt/workerd-gateway/node_modules/.bin/workerd serve config.capnp --experimental
 # With Infisical instead (INFISICAL_TOKEN in the EnvironmentFile above):
-# ExecStart=/usr/bin/infisical run --env=prod --projectId=<id> -- /opt/workerd-gateway/node_modules/.bin/workerd serve config.capnp
+# ExecStart=/usr/bin/infisical run --env=prod --projectId=<id> -- /opt/workerd-gateway/node_modules/.bin/workerd serve config.capnp --experimental
 Restart=always
 RestartSec=2
 NoNewPrivileges=yes
 ProtectSystem=strict
+# Cron scheduler state (data/cron). Everything else stays read-only.
+ReadWritePaths=-/opt/workerd-gateway/data
 PrivateTmp=yes
 # Add ProtectHome=yes if no app in apps/ is a symlink into /home.
 

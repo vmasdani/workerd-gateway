@@ -5,8 +5,8 @@
   "scripts": {
     "gen": "bun gen.ts",
     "build": "bun build src/gateway.ts --outfile dist/gateway.js --target browser --format esm",
-    "dev": "bun run build && bun gen.ts && workerd serve config.capnp --verbose",
-    "start": "workerd serve config.capnp",
+    "dev": "bun run build && bun gen.ts && workerd serve config.capnp --experimental --verbose",
+    "start": "workerd serve config.capnp --experimental",
     "typecheck": "bun check"
   },
   "devDependencies": {

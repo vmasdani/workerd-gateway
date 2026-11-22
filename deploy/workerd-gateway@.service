@@ -1,7 +1,10 @@
-# Multi-instance: one workerd process per instance; the instance name is its port.
-# Install: sudo cp deploy/workerd-gateway@.service /etc/systemd/system/
+# Extra instances for using more cores; the instance name is its port.
+# They run config.lb.capnp, generated without crons, so scheduled jobs run once: only in
+# workerd-gateway.service (port 8080), which stays in the load-balanced pool.
+# Install: bun gen.ts --no-cron --out config.lb.capnp
+#          sudo cp deploy/workerd-gateway@.service /etc/systemd/system/
 #          sudo systemctl daemon-reload
-#          sudo systemctl enable --now workerd-gateway@{8081..8084}    # one per core
+#          sudo systemctl enable --now workerd-gateway@{8081..8083}    # plus 8080 = 4 cores
 # Then load balance across the ports with deploy/nginx-lb.conf or deploy/Caddyfile.lb.
 [Unit]
 Description=workerd gateway :%i
@@ -14,7 +17,7 @@ Group=workerd
 WorkingDirectory=/opt/workerd-gateway
 EnvironmentFile=-/etc/workerd-gateway/env
 # --socket-addr overrides the address of the socket named "http" in config.capnp.
-ExecStart=/opt/workerd-gateway/node_modules/.bin/workerd serve config.capnp --socket-addr http=127.0.0.1:%i
+ExecStart=/opt/workerd-gateway/node_modules/.bin/workerd serve config.lb.capnp --experimental --socket-addr http=127.0.0.1:%i
 Restart=always
 RestartSec=2
 NoNewPrivileges=yes
