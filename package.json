@@ -1,0 +1,20 @@
+{
+  "name": "workerd-gateway",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "gen": "bun gen.ts",
+    "build": "bun build src/gateway.ts --outfile dist/gateway.js --target browser --format esm",
+    "dev": "bun run build && bun gen.ts && workerd serve config.capnp --verbose",
+    "start": "workerd serve config.capnp",
+    "typecheck": "bun check"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261121.1",
+    "@types/bun": "latest",
+    "workerd": "^1.20261121.1"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  }
+}

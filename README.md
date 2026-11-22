@@ -1,0 +1,339 @@
+# workerd-gateway
+
+One [workerd](https://github.com/cloudflare/workerd) process, run as a system-wide systemd service, hosts many apps.
+A small gateway worker in front of them picks the app for each request:
+
+| Request | App | Path the app sees |
+|---|---|---|
+| `http://localhost:8080/app-a/hello?q=abcd` | `app-a` | `/hello?q=abcd` (prefix stripped) |
+| `https://app-a.mydomain.com/hello?q=abcd` | `app-a` | `/hello?q=abcd` |
+| `http://app-a.localhost:8080/hello` | `app-a` | `/hello` (`*.localhost` resolves to 127.0.0.1, no DNS needed) |
+| any host, `/_gateway/health` | gateway | answers `ok` (for load balancer health checks) |
+
+Apps are ordinary Workers: `export default { fetch(req, env) }`. They don't know about the gateway. The same code
+deploys to Cloudflare Workers unchanged.
+
+## Why: the PHP-FPM model for Workers
+
+The setup copies how PHP sites are usually hosted. There's one long-running runtime on the server, a web server routes
+each virtual host to it, and adding a site means dropping a folder in place, not setting up a new service.
+
+| PHP hosting | This repo |
+|---|---|
+| `/var/www/<site>/` | `apps/<name>/` |
+| Apache or nginx virtual host per site | gateway routing by subdomain or path, with no per-app config |
+| PHP-FPM, one system service for every site | one `workerd-gateway` systemd service for every app |
+| FPM pool size (`pm.max_children`) | number of `workerd-gateway@<port>` instances |
+| `php.ini` / pool `env[...]` | per-app bindings in `worker.capnp` |
+
+Benefits:
+
+- **Easier deployment.** A new app is a folder with a `worker.capnp` and its built `worker.js`, followed by
+  `bun gen.ts` and a restart. There's no new systemd unit, port or reverse-proxy entry, and the subdomain works
+  straight away under a wildcard certificate.
+- **One service to run.** You get one unit and one log stream (`journalctl -u workerd-gateway`), and you upgrade
+  workerd once for every app, instead of one Node or Bun process per app, each with its own port and its own pm2 or
+  systemd entry.
+- **Cheap per app.** Each app is a V8 isolate inside the shared process, not a separate runtime process, so an idle
+  app costs a few MB instead of a whole runtime.
+- **Separated apps.** Each app has its own globals and its own bindings. One app can't read another's secrets or
+  module state.
+- **Portable.** Apps use only the standard Workers API, so the same code deploys to Cloudflare Workers when an app
+  outgrows the server.
+
+The model differs from PHP-FPM in three ways:
+
+- **Deploying needs a restart.** PHP reads files on each request, so copying a file is the whole deploy. workerd loads
+  code at startup, so a deploy is `bun gen.ts` plus a restart. With one instance, the restart briefly drops
+  connections. With several instances behind a load balancer, restart them one at a time.
+- **State persists between requests.** FPM resets state after every request. Here an isolate lives as long as the
+  process, so module-scope variables carry over between requests. That's useful for caches, but it's also an easy way
+  to leak data between users by accident.
+- **Apps share a thread.** FPM gives each request its own worker process. Here every app in an instance shares that
+  instance's single JavaScript thread, so one app stuck in a long synchronous loop stalls every other app on the same
+  instance. Running several instances limits the damage. Apps that do heavy CPU work belong on their own instance or
+  outside the hub.
+
+## Quick start
+
+```bash
+bun install
+bun run dev          # build gateway, generate config.capnp, start workerd
+curl http://localhost:8080/hello/hi           # hello world!
+curl http://hello.localhost:8080/hi           # hello world!
+```
+
+`apps/hello` is the example app. Copy its two files to start a new one.
+
+## Codegen: the core of this repo
+
+workerd is configured with a Cap'n Proto file, and Cap'n Proto cannot glob or list a directory: every `import` and
+`embed` must be a literal path. So the list of apps cannot live in a hand-written config. `gen.ts` writes it.
+
+```bash
+bun gen.ts                               # writes config.capnp, listening on 127.0.0.1:8080
+GATEWAY_ADDR=0.0.0.0:9000 bun gen.ts     # other listen address
+```
+
+What it does:
+
+1. Lists `apps/*/` and keeps every folder that contains a `worker.capnp`. Symlinked folders count.
+2. Checks the folder name is a DNS label (`a-z`, `0-9`, `-`, max 63 characters, no leading or trailing `-`). The name is the
+   app's subdomain and path prefix, so anything else is skipped with a warning. Names can't start with `_`, which keeps
+   `/_gateway/*` free.
+3. Writes `config.capnp` with:
+   - one `using AppN = import "apps/<name>/worker.capnp";` per app,
+   - one service `app:<name>` per app, using that file's `worker` const,
+   - the gateway worker with a service binding per app (`env["<name>"]`) and an `APPS` JSON list of the names,
+   - one socket, `http`, pointing at the gateway.
+
+For two apps, the output looks like this:
+
+```capnp
+# GENERATED by gen.ts from apps/*/worker.capnp. Do not edit: run `bun gen.ts`.
+using Workerd = import "/workerd/workerd.capnp";
+using App0 = import "apps/app-a/worker.capnp";
+using App1 = import "apps/app-b/worker.capnp";
+
+const config :Workerd.Config = (
+  services = [
+    (name = "gateway", worker = .gateway),
+    (name = "app:app-a", worker = App0.worker),
+    (name = "app:app-b", worker = App1.worker),
+  ],
+  sockets = [ (name = "http", address = "127.0.0.1:8080", http = (), service = "gateway") ],
+);
+
+const gateway :Workerd.Worker = (
+  modules = [ (name = "gateway", esModule = embed "dist/gateway.js") ],
+  compatibilityDate = "2026-11-01",
+  bindings = [
+    (name = "APPS", json = "[\"app-a\",\"app-b\"]"),
+    (name = "app-a", service = "app:app-a"),
+    (name = "app-b", service = "app:app-b"),
+  ],
+);
+```
+
+`config.capnp` is gitignored. Run `bun gen.ts` again after adding or removing an app, then restart workerd. Imports
+are numbered `App0`, `App1` and so on because Cap'n Proto identifiers can't contain `-` or `_`.
+
+The gateway (`src/gateway.ts`) only routes to names in `APPS`, so a hostname like `constructor.mydomain.com` or a path
+like `/APPS/` can't select something that isn't an app.
+
+## App folder format
+
+Each app folder needs exactly one thing: a `worker.capnp` that defines a const named **`worker`** of type
+`Workerd.Worker`. Everything else is up to the app.
+
+```capnp
+# apps/<name>/worker.capnp
+using Workerd = import "/workerd/workerd.capnp";
+
+const worker :Workerd.Worker = (
+  modules = [ (name = "worker", esModule = embed "dist/worker.js") ],
+  compatibilityDate = "2026-11-01",
+  bindings = [
+    (name = "API_KEY", fromEnvironment = "APP_A_API_KEY"),
+  ],
+);
+```
+
+Rules:
+
+- `embed` paths are relative to the `worker.capnp` that contains them, not to this repo.
+- The embedded module must be a finished ES module. The gateway doesn't build apps: each app builds itself (for
+  example `bun build src/index.ts --outfile dist/worker.js --target browser --format esm`), and `worker.capnp` points
+  at the output.
+- `compatibilityDate` can't be later than the installed workerd version (`bunx workerd --version`).
+- The app owns its bindings (secrets, compatibility flags). The gateway and other apps can't see them.
+
+### Directory structure for several apps
+
+```
+workerd-gateway/
+├── gen.ts                  codegen
+├── src/gateway.ts          router (built to dist/gateway.js)
+├── config.capnp            generated, gitignored
+├── deploy/                 systemd, nginx and Caddy examples
+└── apps/
+    ├── app-1/              app-1.mydomain.com, localhost:8080/app-1/
+    │   ├── worker.capnp    const worker :Workerd.Worker
+    │   └── dist/
+    │       └── worker.js   built by app-1's own build
+    ├── app-2/  -> ~/codes/app-2          symlink to a repo elsewhere
+    │   ├── worker.capnp
+    │   └── dist/worker.js
+    └── app-3/              git submodule
+        ├── worker.capnp
+        ├── package.json    its own build script
+        ├── src/index.ts
+        └── dist/worker.js
+```
+
+An app can live here directly, be a symlink to its repo, or be a git submodule. The only contract is
+`apps/<name>/worker.capnp`. For each app, build it first (`cd apps/app-3 && bun run build`), then run `bun gen.ts` once
+for all of them.
+
+### What an app receives
+
+- **Path:** with path routing, the gateway strips `/<name>` before forwarding and sets
+  `X-Forwarded-Prefix: /<name>`. Use the header if the app builds absolute links. `/<name>` without a trailing slash
+  redirects (308) to `/<name>/` so relative links resolve.
+- **Host, method, query, body and other headers:** forwarded as received, including `X-Forwarded-*` from nginx or
+  Caddy.
+- **Calls between gateway and app:** a service binding call runs inside the same process. There's no network hop.
+
+## Environment variables and secrets
+
+Secrets reach an app as bindings declared in its own `worker.capnp`, usually
+`(name = "API_KEY", fromEnvironment = "APP_A_API_KEY")`. workerd reads them from its process environment once, at
+startup. Each request then finds them on `env` (`env.API_KEY`). Prefix the variable names per app (`APP_A_`, `APP_B_`),
+because all apps share one process environment. Never put a secret in a `text = "..."` binding: that writes the value
+into a file that gets committed.
+
+`gen.ts` never reads secret values. It only generates structure, so nothing secret ends up in `config.capnp`.
+
+There are three ways to supply the values.
+
+### 1. Infisical CLI
+
+`infisical run` fetches the secrets and starts workerd with them in its environment:
+
+```bash
+infisical run --env=prod -- bunx workerd serve config.capnp
+```
+
+Under systemd, put `INFISICAL_TOKEN` (a machine identity token) in the unit's `EnvironmentFile` and wrap `ExecStart`
+the same way (see the commented line in `deploy/workerd-gateway.service`). Store names in Infisical already prefixed
+(`APP_A_API_KEY`), or use one Infisical path per app.
+
+### 2. Your own launcher for another secrets manager
+
+For a secrets manager without a CLI, write a launcher that fetches each app's secrets, adds them to the environment
+with that app's prefix, and then starts workerd:
+
+```ts
+// launch.ts: bun launch.ts -- workerd serve config.capnp
+let cmd = Bun.argv.slice(2);
+if (cmd[0] === "--") cmd = cmd.slice(1);
+
+const env: Record<string, string | undefined> = { ...process.env };
+for (const prefix of ["APP_A", "APP_B"]) {
+  const secrets: Record<string, string> = await fetchSecretsFor(prefix); // your secrets manager's client
+  for (const [k, v] of Object.entries(secrets)) env[`${prefix}_${k}`] = v;
+}
+// Remove the launcher's own credentials so workerd only gets the values.
+
+const child = Bun.spawn(cmd, { env, stdio: ["inherit", "inherit", "inherit"] });
+for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => child.kill(sig));
+process.exit(await child.exited);
+```
+
+Options 1 and 2 share the same trade-offs:
+
+- **Restart to rotate:** a new secret value takes effect only after workerd restarts.
+- **Plaintext in the process environment:** root and the service user can read it from `/proc/<pid>/environ`.
+- **Unchanged app code:** apps only ever read `env.X`, so the code works on Cloudflare too. There, push the same values
+  into Worker secrets at deploy time.
+
+### 3. Fetch at runtime, on the first request (cold start)
+
+The app holds only the secrets manager's client credentials as bindings and fetches its secrets itself. Global scope
+can't do I/O, so the fetch happens on the first request, and a module-level cache keeps the result:
+
+```ts
+const TTL = 5 * 60_000;
+let cache: { at: number; p: Promise<Record<string, string>> } | undefined;
+
+function secrets(env: Env) {
+  if (!cache || Date.now() - cache.at > TTL) {
+    const p = fetchSecrets(env.SM_CLIENT_ID, env.SM_CLIENT_SECRET); // your secrets manager's client
+    cache = { at: Date.now(), p };
+    p.catch(() => { if (cache?.p === p) cache = undefined; }); // retry on the next request
+  }
+  return cache.p;
+}
+
+export default {
+  async fetch(req: Request, env: Env) {
+    const { DATABASE_URL } = await secrets(env);
+    // ...
+  },
+};
+```
+
+Trade-offs:
+
+- **Network round trip on every cold start.** In workerd, an isolate lives as long as the process, so a cold start
+  means the first request after each start or restart, and once more every TTL. With N instances (see below), each
+  instance fetches on its own. On Cloudflare, isolates are evicted often, so the first request on every new isolate
+  pays the round trip.
+- **Runtime dependency:** if the secrets manager is down, cold requests fail, though warm isolates keep working
+  from cache.
+- **Rotation without restart:** new values arrive once the TTL expires. Only the client credentials sit in the process
+  environment.
+- **Private address needs a network service:** workerd's default outbound access only reaches public addresses. If
+  the secrets manager is on a private or loopback address, the hub config needs
+  `(name = "net", network = (allow = ["public", "private", "local"]))` and the app needs `globalOutbound = "net"`.
+  `gen.ts` doesn't generate that yet.
+
+## Running under systemd
+
+One instance is enough for most setups. Install the repo at `/opt/workerd-gateway`, build it, generate the config,
+create a `workerd` system user, and install `deploy/workerd-gateway.service`:
+
+```bash
+sudo useradd --system --no-create-home workerd
+cd /opt/workerd-gateway && bun install && bun run build && bun gen.ts
+sudo cp deploy/workerd-gateway.service /etc/systemd/system/
+sudo install -m 600 -o root /dev/null /etc/workerd-gateway/env    # secrets, if any
+sudo systemctl daemon-reload && sudo systemctl enable --now workerd-gateway
+```
+
+After changing apps: `bun gen.ts && sudo systemctl restart workerd-gateway`.
+
+workerd listens on `127.0.0.1:8080` only. Put nginx (`deploy/nginx.conf`) or Caddy (`deploy/Caddyfile`) in front for
+TLS and subdomains. nginx needs `proxy_set_header Host $host;`: without it, nginx sends `127.0.0.1:8080` as the host and
+subdomain routing breaks. Caddy forwards the original host by default.
+
+## Using all CPU cores (optional)
+
+workerd runs all JavaScript on one thread per process, so one instance uses one core for request handling. You only
+need more instances for high-load I/O or compute-heavy apps, where that one core is saturated. Otherwise, stay with one
+instance.
+
+To scale out, run one instance per core with the template unit, each on its own port, and load balance across them:
+
+```bash
+sudo cp deploy/workerd-gateway@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl disable --now workerd-gateway          # the single instance, if running
+sudo systemctl enable --now workerd-gateway@{8081..8084}
+```
+
+`--socket-addr http=127.0.0.1:%i` in the unit overrides the socket address from `config.capnp`, so all instances share
+one generated config. Then use `deploy/nginx-lb.conf` or `deploy/Caddyfile.lb`, which spread requests with
+`least_conn`. Caddy also health-checks `/_gateway/health`.
+
+Trade-offs:
+
+- **More RAM.** Every instance is a full workerd process that loads its own isolate for the gateway and for every app.
+  Memory grows roughly as instances × (process baseline + every app's isolate). With the gateway and one trivial app,
+  one instance measured about 60 MB RSS; real apps add their own heap and code size on top. Four instances means four
+  copies of everything.
+- **State is per instance.** Module-scope caches, in-memory data and Durable Objects exist separately in each process.
+  Never point several instances at the same Durable Object `localDisk` storage: the same object would run twice over
+  one SQLite file, which leads to conflicting writes or corruption. Route stateful apps to a single instance, or keep
+  their state in an external database.
+- **Secrets are fetched per instance.** With runtime fetching (option 3), each instance pays its own cold start.
+
+## Scripts
+
+| Command | Does |
+|---|---|
+| `bun run build` | builds `src/gateway.ts` to `dist/gateway.js` |
+| `bun gen.ts` | generates `config.capnp` from `apps/*/worker.capnp` |
+| `bun run dev` | build, generate, then `workerd serve --verbose` |
+| `bun run start` | `workerd serve config.capnp` |
+| `bun run typecheck` | `bun check` |

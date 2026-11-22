@@ -1,0 +1,26 @@
+# Single instance: one workerd process, one CPU core for JavaScript.
+# Install: sudo cp deploy/workerd-gateway.service /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable --now workerd-gateway
+[Unit]
+Description=workerd gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=workerd
+Group=workerd
+WorkingDirectory=/opt/workerd-gateway
+# Secrets for apps (fromEnvironment bindings). Keep this file mode 0600, owned by root.
+EnvironmentFile=-/etc/workerd-gateway/env
+ExecStart=/opt/workerd-gateway/node_modules/.bin/workerd serve config.capnp
+# With Infisical instead (INFISICAL_TOKEN in the EnvironmentFile above):
+# ExecStart=/usr/bin/infisical run --env=prod --projectId=<id> -- /opt/workerd-gateway/node_modules/.bin/workerd serve config.capnp
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+# Add ProtectHome=yes if no app in apps/ is a symlink into /home.
+
+[Install]
+WantedBy=multi-user.target

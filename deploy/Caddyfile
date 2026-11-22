@@ -1,0 +1,13 @@
+# Single instance. Caddy forwards the original Host by default and gets certificates itself.
+# A wildcard site needs the DNS challenge: xcaddy build --with github.com/caddy-dns/cloudflare
+*.mydomain.com {
+	tls {
+		dns cloudflare {env.CF_API_TOKEN}
+	}
+	reverse_proxy 127.0.0.1:8080
+}
+
+# Without a wildcard certificate, list the subdomains instead:
+# app-a.mydomain.com, app-b.mydomain.com {
+# 	reverse_proxy 127.0.0.1:8080
+# }

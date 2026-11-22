@@ -1,0 +1,25 @@
+# Multi-instance: one workerd process per instance; the instance name is its port.
+# Install: sudo cp deploy/workerd-gateway@.service /etc/systemd/system/
+#          sudo systemctl daemon-reload
+#          sudo systemctl enable --now workerd-gateway@{8081..8084}    # one per core
+# Then load balance across the ports with deploy/nginx-lb.conf or deploy/Caddyfile.lb.
+[Unit]
+Description=workerd gateway :%i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=workerd
+Group=workerd
+WorkingDirectory=/opt/workerd-gateway
+EnvironmentFile=-/etc/workerd-gateway/env
+# --socket-addr overrides the address of the socket named "http" in config.capnp.
+ExecStart=/opt/workerd-gateway/node_modules/.bin/workerd serve config.capnp --socket-addr http=127.0.0.1:%i
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
