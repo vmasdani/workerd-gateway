@@ -62,12 +62,14 @@ The model differs from PHP-FPM in three ways:
 
 ## Try it out
 
-The repo ships three example apps: `apps/hello` and `apps/hi` (plain JS, no build), and `apps/do-test` (a Durable
-Object background task with Hono, which builds itself):
+The repo ships four example apps: `apps/hello` and `apps/hi` (plain JS, no build), `apps/do-test` (a Durable
+Object background task with Hono, which builds itself), and `apps/reminders` (several timers per object with
+`@cloudflare/actors`, also built):
 
 ```bash
 bun install
 (cd apps/do-test && bun install && bun run build)   # optional: without it, gen.ts skips do-test
+(cd apps/reminders && bun install && bun run build) # optional, same
 bun run dev    # builds the gateway, runs bun gen.ts, starts workerd
 ```
 
@@ -78,6 +80,7 @@ bun run dev    # builds the gateway, runs bun gen.ts, starts workerd
 | http://localhost:8080/hello/hi | `hello world!` (path routing) |
 | http://localhost:8080/hi/hi | `hi world!` (path routing) |
 | http://localhost:8080/do-test/run-task/user1 | starts a 50-second background task; watch the workerd log |
+| http://localhost:8080/reminders/alice?in=10&text=tea | schedules a reminder that logs in 10 seconds; http://localhost:8080/reminders/alice lists pending ones |
 
 `*.localhost` resolves to 127.0.0.1 in browsers and curl, so subdomains work with no DNS or `/etc/hosts` entry. To
 start a new app, copy one of the example folders. `gen.ts` skips an app whose `embed` files don't exist yet, with a
@@ -521,6 +524,61 @@ WantedBy=sockets.target
 [Service]
 ExecStart=/usr/local/bin/pdf-render
 ```
+
+### Several timers per object: `@cloudflare/actors` (optional)
+
+[`@cloudflare/actors`](https://github.com/cloudflare/actors) is Cloudflare's library on top of Durable Objects. Its
+main use here is `this.alarms`: any number of pending timers per object, each calling a named method with its own
+payload. It keeps them in a table and points the one real alarm at the earliest, which is the bookkeeping the
+"one alarm per object" rule above otherwise leaves to you.
+
+`apps/reminders` is the example. Each user is one actor, and each reminder is one timer. Every route is a GET, so
+you can try them in a browser (a real app would use POST and DELETE for the ones that change state):
+
+```
+http://localhost:8080/reminders/alice?in=10&text=tea      {"id":"...","at":"...","text":"tea"}
+http://localhost:8080/reminders/alice?in=60&text=stretch  a second timer; the first stays pending
+http://localhost:8080/reminders/alice                     pending reminders
+http://localhost:8080/reminders/alice/cancel/<id>         cancel one
+```
+
+```ts
+const s = await this.alarms.schedule(10, "remind", { text }); // seconds, a Date, or a cron string
+this.alarms.getSchedules();                                   // pending timers
+await this.alarms.cancelSchedule(s.id);
+```
+
+Under workerd, scheduling, listing, cancelling, firing and resuming after a restart all work (tested with
+`0.0.1-beta.6`).
+
+Use it when an object needs **several independent timers** at once: reminders, per-item expiry, a step timer plus a
+watchdog. Don't use it for a single alarm chain like `apps/do-test` or a repeating counter: `setAlarm()` in
+`alarm()` is a few lines and has no dependency.
+
+What to know before using it:
+
+- **It's beta** (`0.0.1-beta.x`). The API may change between releases. Pin the exact version.
+- **It needs a build step.** It's an npm package, so the app is bundled with `bun build`, with `cloudflare:*` kept
+  external (see `apps/reminders/package.json`). The bundle is about 50 KB, compared with a few KB for a plain object.
+- **The binding must be named exactly like the class.** The library finds the namespace with
+  `import { env } from "cloudflare:workers"` and looks for a binding with the class's name. In `worker.capnp`:
+  `(name = "Reminders", durableObjectNamespace = "Reminders")`. Any other name fails with `No Durable Object binding
+  found for actor class Reminders`.
+- **It needs SQLite storage** (`enableSql = true`). It adds its own tables to the object's database (`_actor_alarms`
+  for timers, `_actor_persist` for `@Persist` fields). Your own tables share that database, so don't use those names.
+- **A failed timer is not retried.** If the callback throws, the library logs the error and deletes the timer
+  (a cron timer moves to its next time). A plain `alarm()` that throws is retried with backoff. For work that must
+  succeed, catch the error in the callback and schedule the timer again yourself.
+- **Times are whole seconds.** Due times are rounded down to the second, so a timer can fire up to a second early.
+- **Don't override `alarm()`.** The base class's `alarm()` runs the timers. To run code on every wake-up, override
+  `onAlarm()` instead, or call `super.alarm()`.
+- **`handler(MyActor)` covers only `fetch`.** It finds the instance with the static `nameFromRequest(req)` (which
+  answers `500 Invalid actor identifier` when it returns `undefined`), forwards the request to the actor's
+  `onRequest()`, and leaves the routing inside to you. An app that also needs `scheduled()` or its own routing in
+  front writes its own default export and uses `MyActor.get(name)` for the stub.
+- **It's Cloudflare-shaped.** Its docs assume Wrangler, and some features (location hints, the `track` option's
+  instance list) mean nothing or add an extra object on a single server. The timers, `@Persist` and SQL migrations
+  are the parts that carry over.
 
 ## Scripts
 
