@@ -232,7 +232,8 @@ Rules:
   [Routing order](#routing-order).
 - An app that names the service `"net"` (normally `globalOutbound = "net"`) can reach loopback addresses as well as
   public ones, e.g. PostgreSQL on `127.0.0.1`. workerd's default outbound only reaches public addresses. `gen.ts`
-  declares `(name = "net", network = (allow = ["public", "local"]))` once any app uses it.
+  declares `(name = "net", network = (allow = ["public", "local"], tlsOptions = (trustBrowserCas = true)))` once any app uses
+  it. `tlsOptions` is required: without it, HTTPS through `net` fails with "this client has no TLS configuration".
 - An app that names the service `"disk:<name>"` in its `worker.capnp` gets a writable directory,
   `data/apps/<name>`, declared by `gen.ts`. Use it as `durableObjectStorage = (localDisk = "disk:<name>")` for
   Durable Objects, or bind it (`(name = "FILES", service = "disk:<name>")`) to read and `PUT` files. See

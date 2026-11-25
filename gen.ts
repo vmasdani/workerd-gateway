@@ -134,7 +134,7 @@ const bindings = lines(apps.map((n) => `    (name = "${n}", service = "app:${n}"
 const diskServices = disks
 	.map((n) => `\n    (name = "disk:${n}", disk = (path = "${APP_DATA_DIR}/${n}", writable = true)),`)
 	.join("");
-const netService = wantsNet ? `\n    (name = "net", network = (allow = ["public", "local"])),` : "";
+const netService = wantsNet ? `\n    (name = "net", network = (allow = ["public", "local"], tlsOptions = (trustBrowserCas = true))),` : "";
 
 const cronServices = `
     (name = "cron", worker = .cron),
