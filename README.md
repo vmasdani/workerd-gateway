@@ -1,6 +1,6 @@
 # workerd-gateway
 
-![workerd-gateway overview: one workerd process hosting many apps, with routing, codegen, secrets, storage, databases, cache, jobs and observability around it](docs/overview.png)
+![workerd-gateway overview: apps/<name>/ folders go through bun gen.ts into config.capnp; requests pass nginx or Caddy to one workerd process that routes to isolated Worker apps by hostname or path; apps hand background work to Durable Objects with per-object state, persistent storage and alarms; an optional built-in cron scheduler triggers apps](docs/overview.png)
 
 One [workerd](https://github.com/cloudflare/workerd) process, run as a system-wide systemd service, hosts many apps.
 A small gateway worker in front of them picks the app for each request:
