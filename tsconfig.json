@@ -26,5 +26,7 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
-  }
+  },
+  // Gateway code only. Apps type-check themselves (an app folder may be a symlink to its own repo).
+  "include": ["*.ts", "src"]
 }
