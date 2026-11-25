@@ -21,6 +21,7 @@ const { values: args } = parseArgs({
 
 const APPS_DIR = "apps";
 const CRON_DIR = "data/cron"; // Durable Object storage of the cron scheduler, relative to the working directory
+const APP_DATA_DIR = "data/apps"; // per-app writable directories, relative to the working directory
 const ADDR = process.env.GATEWAY_ADDR ?? "127.0.0.1:8080";
 const COMPAT_DATE = "2026-11-01";
 
@@ -30,6 +31,7 @@ const NAME = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 const apps: string[] = [];
 const crons: Record<string, string[]> = {};
+const disks: string[] = []; // apps whose worker.capnp uses the "disk:<name>" service
 
 for (const name of readdirSync(APPS_DIR).sort()) {
 	// existsSync follows symlinks, so apps/<name> may be a symlink to another repo.
@@ -38,7 +40,22 @@ for (const name of readdirSync(APPS_DIR).sort()) {
 		console.warn(`skip ${APPS_DIR}/${name}: name must be lowercase letters, digits and "-" (a DNS label)`);
 		continue;
 	}
+	// Every `embed "<path>"` must exist (paths are relative to the app's folder). An app whose build output
+	// is missing is skipped, rather than making workerd refuse to start for every app.
+	const capnp = await Bun.file(`${APPS_DIR}/${name}/worker.capnp`).text();
+	const missing = [...capnp.matchAll(/embed\s+"([^"]+)"/g)]
+		.map((m) => m[1]!)
+		.filter((p) => !existsSync(`${APPS_DIR}/${name}/${p}`));
+	if (missing.length > 0) {
+		console.warn(`skip ${APPS_DIR}/${name}: missing ${missing.join(", ")} (build the app first)`);
+		continue;
+	}
 	apps.push(name);
+
+	// An app that mentions the service "disk:<name>" in its worker.capnp gets a writable directory,
+	// data/apps/<name>, for its Durable Object storage (localDisk) and/or a file-writing binding.
+	// Services must be declared in this file, not in the app's, so the app opts in by naming it.
+	if (capnp.includes(`"disk:${name}"`)) disks.push(name);
 
 	// Optional cron.json: a JSON list of cron expressions (Cloudflare's dialect, UTC) that call
 	// the app's scheduled() handler. workerd validates the expressions when it loads the config.
@@ -54,12 +71,16 @@ for (const name of readdirSync(APPS_DIR).sort()) {
 
 const withCron = !args["no-cron"] && Object.keys(crons).length > 0;
 if (withCron) mkdirSync(CRON_DIR, { recursive: true });
+for (const n of disks) mkdirSync(`${APP_DATA_DIR}/${n}`, { recursive: true });
 
 // Cap'n Proto identifiers cannot contain "-" or "_", so imports are numbered (App0, App1, ...).
 const lines = (xs: string[]) => xs.join("\n");
 const imports = lines(apps.map((n, i) => `using App${i} = import "${APPS_DIR}/${n}/worker.capnp";`));
 const services = lines(apps.map((n, i) => `    (name = "app:${n}", worker = App${i}.worker),`));
 const bindings = lines(apps.map((n) => `    (name = "${n}", service = "app:${n}"),`));
+const diskServices = disks
+	.map((n) => `\n    (name = "disk:${n}", disk = (path = "${APP_DATA_DIR}/${n}", writable = true)),`)
+	.join("");
 
 const cronServices = `
     (name = "cron", worker = .cron),
@@ -91,7 +112,7 @@ ${imports}
 const config :Workerd.Config = (
   services = [
     (name = "gateway", worker = .gateway),
-${services}${withCron ? cronServices : ""}
+${services}${diskServices}${withCron ? cronServices : ""}
   ],
   sockets = [ (name = "http", address = "${ADDR}", http = (), service = "gateway") ],
 );

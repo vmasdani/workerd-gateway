@@ -50,18 +50,22 @@ The model differs from PHP-FPM in three ways:
   connections. With several instances behind a load balancer, restart them one at a time.
 - **State persists between requests.** FPM resets state after every request. Here an isolate lives as long as the
   process, so module-scope variables carry over between requests. That's useful for caches, but it's also an easy way
-  to leak data between users by accident.
+  to leak data between users by accident. State that must survive a restart belongs in a Durable Object or a database
+  (see [Background tasks and state](#background-tasks-and-state-durable-objects)).
 - **Apps share a thread.** FPM gives each request its own worker process. Here every app in an instance shares that
   instance's single JavaScript thread, so one app stuck in a long synchronous loop stalls every other app on the same
   instance. Running several instances limits the damage. Apps that do heavy CPU work belong on their own instance or
-  outside the hub.
+  outside the hub. Long-running work that mostly waits (on LLM calls, APIs, other services) runs in Durable Objects,
+  not in a separate service.
 
 ## Try it out
 
-The repo ships two example apps, `apps/hello` and `apps/hi`:
+The repo ships three example apps: `apps/hello` and `apps/hi` (plain JS, no build), and `apps/do-test` (a Durable
+Object background task with Hono, which builds itself):
 
 ```bash
 bun install
+(cd apps/do-test && bun install && bun run build)   # optional: without it, gen.ts skips do-test
 bun run dev    # builds the gateway, runs bun gen.ts, starts workerd
 ```
 
@@ -71,9 +75,11 @@ bun run dev    # builds the gateway, runs bun gen.ts, starts workerd
 | http://hi.localhost:8080/hi | `hi world!` |
 | http://localhost:8080/hello/hi | `hello world!` (path routing) |
 | http://localhost:8080/hi/hi | `hi world!` (path routing) |
+| http://localhost:8080/do-test/run-task/user1 | starts a 50-second background task; watch the workerd log |
 
 `*.localhost` resolves to 127.0.0.1 in browsers and curl, so subdomains work with no DNS or `/etc/hosts` entry. To
-start a new app, copy one of the example folders.
+start a new app, copy one of the example folders. `gen.ts` skips an app whose `embed` files don't exist yet, with a
+warning to build it first.
 
 `bun run dev` passes `--experimental` for you. If you run workerd by hand without it, it refuses to start, because
 the built-in cron scheduler uses experimental features:
@@ -103,11 +109,15 @@ What it does:
 2. Checks the folder name is a DNS label (`a-z`, `0-9`, `-`, max 63 characters, no leading or trailing `-`). The name is the
    app's subdomain and path prefix, so anything else is skipped with a warning. Names can't start with `_`, which keeps
    `/_gateway/*` free.
-3. Writes `config.capnp` with:
+3. Checks that every file the app's `worker.capnp` embeds exists, and skips the app with a warning if one doesn't
+   (its build hasn't run yet).
+4. Writes `config.capnp` with:
    - one `using AppN = import "apps/<name>/worker.capnp";` per app,
    - one service `app:<name>` per app, using that file's `worker` const,
    - the gateway worker with a service binding per app (`env["<name>"]`) and an `APPS` JSON list of the names,
    - one socket, `http`, pointing at the gateway,
+   - a writable disk service `disk:<name>` at `data/apps/<name>` for each app whose `worker.capnp` names it (for
+     Durable Object storage and files),
    - if any app has a `cron.json` (and `--no-cron` isn't set): workerd's built-in cron scheduler, a `cron` worker
      running the bundled `/workerd/cron.js` with its state in `data/cron` (see [Scheduled jobs](#scheduled-jobs-cron)).
 
@@ -174,6 +184,10 @@ Rules:
 - The app owns its bindings (secrets, compatibility flags). The gateway and other apps can't see them.
 - `cron.json`, if present, is a JSON list of cron expressions, the same as `triggers.crons` in a Wrangler config:
   `["0 3 * * *", "*/15 * * * *"]`.
+- An app that names the service `"disk:<name>"` in its `worker.capnp` gets a writable directory,
+  `data/apps/<name>`, declared by `gen.ts`. Use it as `durableObjectStorage = (localDisk = "disk:<name>")` for
+  Durable Objects, or bind it (`(name = "FILES", service = "disk:<name>")`) to read and `PUT` files. See
+  `apps/do-test`. Like cron state, it must belong to one instance only.
 
 ### Directory structure for several apps
 
@@ -365,6 +379,99 @@ Trade-offs:
   their state in an external database.
 - **Secrets are fetched per instance.** With runtime fetching (option 3), each instance pays its own cold start.
 
+## Background tasks and state: Durable Objects
+
+**The principle: Durable Objects replace background tasks and in-process state.** Where a Node, Bun, Python or Go
+server would start a thread, a goroutine, a background promise or a job-queue worker, an app in this hub starts a
+Durable Object. Don't add a separate long-running service for it.
+
+workerd gives an app no background thread of its own. A request's work ends with the request, module-scope variables
+are lost on restart and exist separately in each instance, and a busy loop stalls every app on the instance. A Durable
+Object is a named, single-threaded object with its own SQLite database and an alarm that wakes it up. It comes into
+existence on its first call, is evicted from memory when idle (costing nothing while it waits), and picks up from its
+storage after a restart. The same code runs on Cloudflare.
+
+| Traditional server | Durable Object |
+|---|---|
+| Spawn a thread or background job, return `202` | `stub.start(input)` saves the input, sets an alarm, returns at once |
+| Job loop: `while (!done) step()` | `alarm()` runs one step, saves progress, sets the next alarm |
+| In-memory job map, `Map<jobId, Job>` | one object per job or session, `idFromName(id)`, state in its SQLite |
+| Queue worker with retries | an `alarm()` that throws is retried with backoff (`alarmInfo.retryCount` counts attempts) |
+| WebSocket server and subscriber list | `ctx.acceptWebSocket()` and `ctx.getWebSockets()` in the same object |
+| Worker pool, fan-out | child objects, each calling the parent back by RPC when done |
+| Mutex around shared state | none: an object handles one event at a time |
+| A crash loses running jobs | the pending alarm fires again after a restart, and the job resumes at its last checkpoint |
+
+`apps/do-test` is a working example: `GET /do-test/run-task/user1` starts user1's object, which logs five simulated
+tasks 10 seconds apart and then writes `data/apps/do-test/results/user1.txt`. `/do-test/status/user1` and
+`/do-test/result/user1` report on it. Kill workerd mid-run and start it again, and the run continues where it stopped.
+
+The shape of a real job, for example an LLM agent loop:
+
+```ts
+export class Job extends DurableObject<Env> {
+	async start(input: Input) {                       // RPC from the app's fetch handler
+		this.save({ input, step: 0 });
+		await this.ctx.storage.setAlarm(Date.now());   // run the first step right away
+	}
+
+	override async alarm() {
+		const state = this.load();
+		const next = await step(state);                // one LLM call or one sidecar call: awaiting is fine
+		this.save(next);                               // checkpoint before scheduling the next step
+		if (next.done) await this.finish(next);
+		else await this.ctx.storage.setAlarm(Date.now());   // next step now; a pause is just a later time
+	}
+
+	async finish(result: Result) {
+		await storeResult(result);                     // database, object store or file: wherever it lives on
+		await this.ctx.storage.deleteAlarm();
+		await this.ctx.storage.deleteAll();            // only after the result is safely stored
+	}
+}
+```
+
+Rules that keep it correct:
+
+- **One step per alarm.** Awaiting I/O inside a step is fine, however long the LLM takes to answer. Keep CPU work
+  short, since it runs on the shared thread.
+- **Checkpoint every step, and expect repeats.** A step that throws runs again from the start, so an LLM call in it is
+  made and paid for again. Save expensive results as soon as they arrive, and check storage before repeating them.
+- **One alarm per object.** `setAlarm()` replaces the pending alarm. If an object needs several timers (the next step
+  and a watchdog, say), keep them in a table and always set the alarm to the earliest.
+- **Fan out to child objects, and never await them.** The parent starts N children at a time (an API rate limit is
+  usually the real bound), each child runs its own alarm chain, and reports back with `parent.childDone(id, result)`
+  or `parent.childFailed(id, error)`. The parent starts the next child, or the next phase once all are done.
+- **Keep large data out of the object.** Page images, uploads and exports go to the object store. The object keeps
+  their keys and small JSON.
+- **Clean up yourself.** Nothing expires on its own, here or on Cloudflare. Call `deleteAll()` when a job ends, and
+  give idle jobs a timeout (an alarm a few days out that finishes or discards an abandoned job). In workerd,
+  `deleteAll()` empties the object's SQLite file but leaves a small empty file behind for every object name ever
+  used, so prefer names that are reused (one per user or per session) to one per job, or remove empty `<hash>.sqlite`
+  files while workerd is stopped. On Cloudflare, an emptied object holds no billable storage.
+- **One instance.** An app's objects live in the `data/apps/<name>` directory of the one instance that owns it (see
+  [App folder format](#app-folder-format) and [Using all CPU cores](#using-all-cpu-cores-optional)).
+
+**When a separate service is still the answer:** work workerd can't do, such as starting processes, native libraries
+(PDF rendering, image processing) or long CPU-bound computation. Keep the job itself in a Durable Object and call the
+service once per step over HTTP. To keep it lazy instead of always running, start it with systemd socket activation,
+so it starts on the first connection and can exit when idle:
+
+```ini
+# /etc/systemd/system/pdf-render.socket
+[Socket]
+ListenStream=127.0.0.1:9100
+
+[Install]
+WantedBy=sockets.target
+
+# /etc/systemd/system/pdf-render.service: started by the first connection to the socket.
+# The program takes the listening socket from systemd (LISTEN_FDS) and exits after a while with
+# no requests. A program that can't do that can sit behind systemd-socket-proxyd --exit-idle-time.
+[Service]
+ExecStart=/usr/local/bin/pdf-render
+```
+
 ## Scripts
 
 | Command | Does |
@@ -383,6 +490,7 @@ line and are only worth it when the default falls short.
 | Need | Default | Also works |
 |---|---|---|
 | Scheduled jobs | workerd's built-in cron (`cron.json`) | systemd timer, your own scheduler |
+| Background tasks, job state | Durable Objects with alarms (built in, see [above](#background-tasks-and-state-durable-objects)) | a socket-activated service, only for work workerd can't do |
 | Secrets | `fromEnvironment` bindings filled by `infisical run` | env file, OpenBao or Vault, SOPS, your own launcher |
 | Files and media | [RustFS](https://rustfs.com) (S3 API) | MinIO, Garage, SeaweedFS, Cloudflare R2 |
 | Database | [libSQL / sqld](https://github.com/tursodatabase/libsql) | SQLite in a Durable Object (one instance only), PostgreSQL |
@@ -453,8 +561,9 @@ WantedBy=timers.target
 ```
 
 **That endpoint must check the token.** nginx and Caddy expose every app path publicly. A systemd timer doesn't retry
-on its own, and the endpoint is specific to this setup, so it doesn't port to Cloudflare. Use your own scheduler, for
-example a Rust service, only when you need queues or job history.
+on its own, and the endpoint is specific to this setup, so it doesn't port to Cloudflare. For queues or job history,
+use Durable Objects (see [Background tasks and state](#background-tasks-and-state-durable-objects)) rather than a
+scheduler service of your own.
 
 ### Files and media
 
