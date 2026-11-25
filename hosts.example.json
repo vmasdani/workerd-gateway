@@ -1,0 +1,5 @@
+{
+  "admin.example.com": "hello",
+  "*.shops.example.com": "hi",
+  "*": "hello"
+}

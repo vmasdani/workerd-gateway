@@ -10,6 +10,8 @@ A small gateway worker in front of them picks the app for each request:
 | `http://localhost:8080/app-a/hello?q=abcd` | `app-a` | `/hello?q=abcd` (prefix stripped) |
 | `https://app-a.mydomain.com/hello?q=abcd` | `app-a` | `/hello?q=abcd` |
 | `http://app-a.localhost:8080/hello` | `app-a` | `/hello` (`*.localhost` resolves to 127.0.0.1, no DNS needed) |
+| `https://admin.example.com/hello`, `https://shop1.example.com/hello` | the app whose `hosts.json` lists `admin.example.com` or `*.example.com` | `/hello` |
+| any other host (a customer's own domain) | the app whose `hosts.json` lists `*`, if any | unchanged |
 | any host, `/_gateway/health` | gateway | answers `ok` (for load balancer health checks) |
 
 Apps are ordinary Workers: `export default { fetch(req, env) }`. They don't know about the gateway. The same code
@@ -114,10 +116,12 @@ What it does:
 4. Writes `config.capnp` with:
    - one `using AppN = import "apps/<name>/worker.capnp";` per app,
    - one service `app:<name>` per app, using that file's `worker` const,
-   - the gateway worker with a service binding per app (`env["<name>"]`) and an `APPS` JSON list of the names,
+   - the gateway worker with a service binding per app (`env["<name>"]`), an `APPS` JSON list of the names, and a
+     `HOSTS` JSON map from each `hosts.json` pattern (the apps' and the hub's) to its app,
    - one socket, `http`, pointing at the gateway,
    - a writable disk service `disk:<name>` at `data/apps/<name>` for each app whose `worker.capnp` names it (for
      Durable Object storage and files),
+   - a network service `net` (public addresses plus loopback) if any app's `worker.capnp` names it,
    - if any app has a `cron.json` (and `--no-cron` isn't set): workerd's built-in cron scheduler, a `cron` worker
      running the bundled `/workerd/cron.js` with its state in `data/cron` (see [Scheduled jobs](#scheduled-jobs-cron)).
 
@@ -143,6 +147,7 @@ const gateway :Workerd.Worker = (
   compatibilityDate = "2026-11-01",
   bindings = [
     (name = "APPS", json = "[\"app-a\",\"app-b\"]"),
+    (name = "HOSTS", json = "{}"),
     (name = "app-a", service = "app:app-a"),
     (name = "app-b", service = "app:app-b"),
   ],
@@ -155,11 +160,48 @@ are numbered `App0`, `App1` and so on because Cap'n Proto identifiers can't cont
 The gateway (`src/gateway.ts`) only routes to names in `APPS`, so a hostname like `constructor.mydomain.com` or a path
 like `/APPS/` can't select something that isn't an app.
 
+### Routing order
+
+The gateway tries these in order and uses the first that matches:
+
+1. `/_gateway/health` on any host answers `ok`.
+2. An exact host from some app's `hosts.json`.
+3. A `*.<suffix>` pattern from `hosts.json`, longest suffix first. `*.example.com` matches `a.example.com` and
+   `a.b.example.com`, not `example.com` itself.
+4. Subdomain routing: the first label of the host is an app name.
+5. Path routing: the first path segment is an app name (prefix stripped).
+6. The app whose `hosts.json` lists `*`.
+7. `404 not found`.
+
+Hosts claimed in `hosts.json` never reach subdomain or path routing, so an app that owns its hosts sees every path
+unchanged. A host that only the `*` app catches still goes through steps 4 and 5 first: on a customer domain,
+`hello.customer.com` or `customer.com/hello/` reaches the app `hello`. Avoid app names that clash with the catch-all
+app's first path segments (`api`, `assets` and the like).
+
+### Hub-level hosts.json (this server's hostnames)
+
+Hostnames usually belong to the server, not to the app's repo: the same app can run on several servers under
+different domains. Put them in `hosts.json` at the hub root, which is gitignored (copy `hosts.example.json`):
+
+```json
+{
+  "admin.example.com": "usdtpg",
+  "*.shops.example.com": "usdtpg",
+  "*": "usdtpg"
+}
+```
+
+- Same patterns as an app's `hosts.json`, mapped to an app name.
+- It wins over an app's own `hosts.json` for the same pattern (`gen.ts` prints a warning when it moves one).
+- An entry for an app that isn't in `apps/` (or was skipped) is ignored with a warning.
+- `GATEWAY_HOSTS=hosts.prod.json bun gen.ts` reads another file.
+- Like the app files, it takes effect after `bun gen.ts` and a restart.
+
 ## App folder format
 
 Each app folder needs exactly one thing: a `worker.capnp` that defines a const named **`worker`** of type
-`Workerd.Worker`. Optionally, a `cron.json` schedules the app's `scheduled()` handler. Everything else is up to the
-app.
+`Workerd.Worker`. Optionally, a `cron.json` schedules the app's `scheduled()` handler, and a `hosts.json` claims
+hostnames for it. Everything else is up to the app.
 
 ```capnp
 # apps/<name>/worker.capnp
@@ -184,6 +226,13 @@ Rules:
 - The app owns its bindings (secrets, compatibility flags). The gateway and other apps can't see them.
 - `cron.json`, if present, is a JSON list of cron expressions, the same as `triggers.crons` in a Wrangler config:
   `["0 3 * * *", "*/15 * * * *"]`.
+- `hosts.json`, if present, is a JSON list of lowercase hostnames the app answers besides `<name>.<anything>`:
+  exact hosts (`admin.example.com`), wildcards (`*.example.com`), or `"*"` for every host no other rule picks (custom
+  domains). A pattern can belong to one app only: `gen.ts` stops with an error if two apps claim it. See
+  [Routing order](#routing-order).
+- An app that names the service `"net"` (normally `globalOutbound = "net"`) can reach loopback addresses as well as
+  public ones, e.g. PostgreSQL on `127.0.0.1`. workerd's default outbound only reaches public addresses. `gen.ts`
+  declares `(name = "net", network = (allow = ["public", "local"]))` once any app uses it.
 - An app that names the service `"disk:<name>"` in its `worker.capnp` gets a writable directory,
   `data/apps/<name>`, declared by `gen.ts`. Use it as `durableObjectStorage = (localDisk = "disk:<name>")` for
   Durable Objects, or bind it (`(name = "FILES", service = "disk:<name>")`) to read and `PUT` files. See
@@ -317,9 +366,9 @@ Trade-offs:
 - **Rotation without restart:** new values arrive once the TTL expires. Only the client credentials sit in the process
   environment.
 - **Private address needs a network service:** workerd's default outbound access only reaches public addresses. If
-  the secrets manager is on a private or loopback address, the hub config needs
-  `(name = "net", network = (allow = ["public", "private", "local"]))` and the app needs `globalOutbound = "net"`.
-  `gen.ts` doesn't generate that yet.
+  the secrets manager is on loopback, set `globalOutbound = "net"` in the app's `worker.capnp` (see
+  [App folder format](#app-folder-format)). For a private-network address, `net` would also need `"private"` in its
+  `allow` list, which `gen.ts` doesn't add.
 
 ## Running under systemd
 
@@ -498,9 +547,9 @@ line and are only worth it when the default falls short.
 | Logs | journald (`journalctl -u workerd-gateway -f`) | Vector or Grafana Alloy into Loki |
 
 Services other than cron and logs run next to workerd, usually on localhost or a private network. workerd's default
-outbound access only reaches public addresses, so an app that calls them needs a network service such as
-`(name = "net", network = (allow = ["public", "private", "local"]))` in the hub config, plus `globalOutbound = "net"` in
-its `worker.capnp`. `gen.ts` doesn't generate that yet.
+outbound access only reaches public addresses, so an app that calls them sets `globalOutbound = "net"` in its
+`worker.capnp`, and `gen.ts` declares `net` (public plus loopback). Services on a private network would also need
+`"private"` in its `allow` list, which `gen.ts` doesn't add.
 
 ### Scheduled jobs (cron)
 
