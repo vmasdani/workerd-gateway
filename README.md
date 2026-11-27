@@ -272,6 +272,9 @@ A single Durable Object is only safe with one workerd instance (see [Using all C
 For several instances, keep the schema and routes and switch the driver to libSQL (see [Database](#database)).
 Small per-object state, like a status row in `apps/do-test`, can stay on `ctx.storage.get`/`put` or one `sql.exec`.
 
+For a full app with a React UI, JWT auth and D1/R2 or libSQL/S3, follow
+[docs/spec-hono-workerd.md](docs/spec-hono-workerd.md), a spec written for coding agents.
+
 ### Directory structure for several apps
 
 ```
