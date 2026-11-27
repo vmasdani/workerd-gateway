@@ -83,8 +83,8 @@ bun run dev    # builds the gateway, runs bun gen.ts, starts workerd
 | http://localhost:8080/reminders/alice?in=10&text=tea | schedules a reminder that logs in 10 seconds; http://localhost:8080/reminders/alice lists pending ones |
 
 `*.localhost` resolves to 127.0.0.1 in browsers and curl, so subdomains work with no DNS or `/etc/hosts` entry. To
-start a new app, copy one of the example folders. `gen.ts` skips an app whose `embed` files don't exist yet, with a
-warning to build it first.
+start a new app, copy `templates/app` (see [Starting a new app](#starting-a-new-app-hono--drizzle)). `gen.ts` skips an
+app whose `embed` files don't exist yet, with a warning to build it first.
 
 `bun run dev` passes `--experimental` for you. If you run workerd by hand without it, it refuses to start, because
 the built-in cron scheduler uses experimental features:
@@ -241,6 +241,36 @@ Rules:
   `data/apps/<name>`, declared by `gen.ts`. Use it as `durableObjectStorage = (localDisk = "disk:<name>")` for
   Durable Objects, or bind it (`(name = "FILES", service = "disk:<name>")`) to read and `PUT` files. See
   `apps/do-test`. Like cron state, it must belong to one instance only.
+
+### Starting a new app: Hono + Drizzle
+
+New apps start from `templates/app`, so that every app has the same structure: [Hono](https://hono.dev) for routing,
+[zod](https://zod.dev) through `@hono/zod-validator` for request input, and [Drizzle](https://orm.drizzle.team) for
+queries. Don't hand-write routers or SQL strings. With the schema in TypeScript, `bun run typecheck` catches a wrong
+column name or type at build time, which a raw `sql.exec("...")` string would only show when it runs. The template
+stores data in one SQLite-backed Durable Object, so it needs no extra service.
+
+```bash
+cp -r templates/app apps/<name>
+sed -i 's/__APP__/<name>/g' apps/<name>/worker.capnp apps/<name>/package.json
+cd apps/<name> && bun install && bun run typecheck && bun run build
+cd ../.. && bun run dev    # then: curl -XPOST -d '{"text":"hi"}' -H 'content-type: application/json' localhost:8080/<name>/notes
+```
+
+| File | Purpose |
+|---|---|
+| `src/worker.ts` | Hono routes and the `Db` Durable Object, whose RPC methods run the Drizzle queries |
+| `src/db/schema.ts` | tables; after a change run `bun run db:generate`, then commit `drizzle/` |
+| `drizzle/` | generated migrations, bundled into `dist/worker.js` and applied when the object wakes up |
+| `worker.capnp` | the `Db` namespace (`enableSql = true`) and its storage in `disk:<name>` |
+
+Dependencies use caret ranges and the template commits `bun.lock`; don't use `"latest"`. The `__APP__` placeholder
+appears in the `disk:` service name (it must match the folder name, see the rules above) and in the namespace's
+`uniqueKey`.
+
+A single Durable Object is only safe with one workerd instance (see [Using all CPU cores](#using-all-cpu-cores-optional)).
+For several instances, keep the schema and routes and switch the driver to libSQL (see [Database](#database)).
+Small per-object state, like a status row in `apps/do-test`, can stay on `ctx.storage.get`/`put` or one `sql.exec`.
 
 ### Directory structure for several apps
 
@@ -597,6 +627,8 @@ line and are only worth it when the default falls short.
 
 | Need | Default | Also works |
 |---|---|---|
+| HTTP routing, input validation | [Hono](https://hono.dev) with `@hono/zod-validator` (see [Starting a new app](#starting-a-new-app-hono--drizzle)) | plain `fetch` handler, for an app with one or two routes |
+| Queries | [Drizzle](https://orm.drizzle.team) (`drizzle-orm/libsql`, `drizzle-orm/durable-sqlite`, `drizzle-orm/postgres-js`) | `ctx.storage.get`/`put` for small per-object state |
 | Scheduled jobs | workerd's built-in cron (`cron.json`) | systemd timer, your own scheduler |
 | Background tasks, job state | Durable Objects with alarms (built in, see [above](#background-tasks-and-state-durable-objects)) | a socket-activated service, only for work workerd can't do |
 | Secrets | `fromEnvironment` bindings filled by `infisical run` | env file, OpenBao or Vault, SOPS, your own launcher |
